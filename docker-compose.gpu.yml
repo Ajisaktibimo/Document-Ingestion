@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  api:
+    build:
+      context: .
+      args:
+        - DOCUMENT_PARSER=docling
+        - DEVICE=gpu
+        - DENSE_EMBEDDING_CPU_MODEL=${DENSE_EMBEDDING_CPU_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+        - DENSE_EMBEDDING_BACKEND=${GPU_DENSE_EMBEDDING_BACKEND:-${DENSE_EMBEDDING_BACKEND:-onnx}}
+    environment:
+      - EMBEDDING_MODEL=${GPU_EMBEDDING_MODEL:-${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}}
+      - DENSE_EMBEDDING_BACKEND=${GPU_DENSE_EMBEDDING_BACKEND:-${DENSE_EMBEDDING_BACKEND:-onnx}}
+      - DENSE_EMBEDDING_DEVICE=${GPU_DENSE_EMBEDDING_DEVICE:-cuda}
+      - DENSE_EMBEDDING_GPU_MODEL=${DENSE_EMBEDDING_GPU_MODEL:-nomic-ai/nomic-embed-text-v2-moe}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+
+  mcp:
+    build:
+      context: .
+      args:
+        - DOCUMENT_PARSER=docling
+        - DEVICE=gpu
+        - DENSE_EMBEDDING_CPU_MODEL=${DENSE_EMBEDDING_CPU_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+        - DENSE_EMBEDDING_BACKEND=${GPU_DENSE_EMBEDDING_BACKEND:-${DENSE_EMBEDDING_BACKEND:-onnx}}
+    environment:
+      - EMBEDDING_MODEL=${GPU_EMBEDDING_MODEL:-${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}}
+      - DENSE_EMBEDDING_BACKEND=${GPU_DENSE_EMBEDDING_BACKEND:-${DENSE_EMBEDDING_BACKEND:-onnx}}
+      - DENSE_EMBEDDING_DEVICE=${GPU_DENSE_EMBEDDING_DEVICE:-cuda}
+      - DENSE_EMBEDDING_GPU_MODEL=${DENSE_EMBEDDING_GPU_MODEL:-nomic-ai/nomic-embed-text-v2-moe}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]

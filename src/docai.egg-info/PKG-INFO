@@ -1,0 +1,232 @@
+Metadata-Version: 2.4
+Name: docai
+Version: 0.1.0
+Summary: Document-Grounded RAG System
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi[standard]>=0.115
+Requires-Dist: uvicorn[standard]
+Requires-Dist: celery[redis]>=5.3
+Requires-Dist: redis>=5.0
+Requires-Dist: sentence-transformers[onnx]>=3.0
+Requires-Dist: transformers<4.56,>=4.41
+Requires-Dist: fastembed>=0.4
+Requires-Dist: qdrant-client>=1.12
+Requires-Dist: asyncpg
+Requires-Dist: sqlalchemy[asyncio]>=2.0
+Requires-Dist: alembic
+Requires-Dist: fastmcp>=0.1.0
+Requires-Dist: python-dotenv
+Requires-Dist: datasketch
+Requires-Dist: pydantic>=2.0
+Requires-Dist: pydantic-settings>=2.0
+Requires-Dist: httpx
+Requires-Dist: ollama
+Requires-Dist: tiktoken
+Requires-Dist: python-docx
+Requires-Dist: falkordb>=1.0.1
+Requires-Dist: einops
+Requires-Dist: numpy
+Requires-Dist: python-multipart
+Requires-Dist: PyYAML
+Provides-Extra: paddle
+Requires-Dist: paddleocr>=2.9; extra == "paddle"
+Requires-Dist: paddlepaddle>=2.9; extra == "paddle"
+Provides-Extra: paddle-gpu
+Requires-Dist: paddleocr>=2.9; extra == "paddle-gpu"
+Requires-Dist: paddlepaddle-gpu>=2.9; extra == "paddle-gpu"
+Provides-Extra: marker
+Requires-Dist: marker-pdf>=1.0; extra == "marker"
+Provides-Extra: mineru
+Requires-Dist: magic-pdf[full]>=0.6.0; extra == "mineru"
+Provides-Extra: docling
+Requires-Dist: docling>=1.0.0; extra == "docling"
+Provides-Extra: chandra
+Requires-Dist: chandra-ocr[hf]; extra == "chandra"
+Provides-Extra: all
+Requires-Dist: paddleocr>=2.9; extra == "all"
+Requires-Dist: marker-pdf>=1.0; extra == "all"
+Requires-Dist: magic-pdf[full]>=0.6.0; extra == "all"
+Requires-Dist: docling>=1.0.0; extra == "all"
+
+# Architecture Diagrams — Schema & Extension Guide (v2.3)
+
+Six focused diagrams for a 2026 on-premise document-grounded conversational AI.
+
+**v2.3 change:** Symmetric hybrid retrieval across both conversation and document stores. Conversation memory now stores dense + sparse vectors (was dense-only), uses RRF fusion + BGE re-ranker before composite scoring. The retrieval quality contract is identical between conversation and document tiers.
+
+---
+
+## Core Design Decisions
+
+### 1. Access boundary is structural, not a convention
+- **Conversation memory** (Redis hot, Qdrant episodic) — accessed DIRECTLY by orchestrator. No MCP layer.
+- **Document memory** (Qdrant doc_chunks, Postgres parents, FalkorDB) — accessed ONLY via MCP tools.
+- This is enforced at the deployment level — orchestrator has no FalkorDB credentials.
+
+### 2. Symmetric hybrid retrieval
+Both stores use the same 3-stage retrieval pipeline:
+```
+dense + sparse search → RRF fusion → BGE re-ranker → final scoring
+```
+For conversation, final scoring is composite: `α·rerank + β·importance + γ·recency + δ·usage`.
+For documents, final scoring is just rerank score + payload filtering.
+
+### 3. Two-track document ingestion
+- **Track A (always)** — chunk → enrich → embed → index. Fast. No gate. Document searchable in seconds.
+- **Track B (conditional)** — only if doc_class has ontology mapping. Agentic validation. Writes to FalkorDB.
+- Track B failures never block Track A.
+
+### 4. Dual-mode read path
+- **Simple turn** — conversation hybrid retrieval → assemble → generate. ~1–3s.
+- **Complex turn** — conversation retrieval + MCP tool loop for documents/graph. ~3–10s.
+
+### 5. Conversations never write to FalkorDB
+Document extraction errors compound silently. Conversation extraction errors recover. Keep them separate.
+
+---
+
+## Diagram Index
+
+| # | File | Purpose |
+|---|---|---|
+| 01 | `01-request-flow.mermaid` | Dual-mode read path · hybrid retrieval for conversation · MCP for documents |
+| 02 | `02-memory-architecture.mermaid` | Memory tiers with access boundary and symmetric hybrid schemas |
+| 03 | `03-async-pipeline.mermaid` | Conversation memory pipeline with dual embedding worker |
+| 04 | `04-deployment-topology.mermaid` | Containers, ports, MCP node, GPU node with Chandra |
+| 05 | `05-document-ingestion.mermaid` | Two-track ingestion: Track A (retrieval) + Track B (knowledge) |
+| 06 | `06-mcp-tool-registry.mermaid` | All MCP tool contracts and backing services |
+
+---
+
+## Retrieval Quality Pipeline (symmetric across both stores)
+
+```
+Stage 1 — Recall (parallel)
+├── Dense search:  cosine similarity on nomic-embed-text-v2 vectors
+└── Sparse search: BM42 lexical match
+
+Stage 2 — Fusion
+└── RRF (Reciprocal Rank Fusion) — merge ranked lists, top-K candidates
+
+Stage 3 — Re-rank
+└── BGE-reranker-v2-m3 — cross-encoder per-pair relevance score
+
+Stage 4 — Final scoring (differs per store)
+├── Conversation: composite α·rerank + β·importance_decayed + γ·recency + δ·usage
+└── Document:    rerank_score + payload filters (doc_type, language, date range)
+```
+
+Both stores must store `dense + sparse` vectors. Diagrams 02 and 03 reflect this.
+
+---
+
+## Conversation Importance Scoring
+
+At write time (Diagram 03), a small LLM scores each turn on:
+- emotional disclosure
+- stated preference
+- explicit commitment
+- domain fact
+- correction of prior turn
+
+Output: `importance: float[0,1]`. Decayed daily by `importance · e^(-λ·days)`, λ=0.01.
+
+Boosted on retrieval (`retrieved_count` and `last_retrieved_at` updated every hit).
+Manually boosted via `boost_importance` MCP tool when user explicitly references a past turn.
+
+---
+
+## Document Ingestion — Two-Track Model
+
+### Track A — Always runs (retrieval indexing)
+```
+Chandra OCR → Enrich (heading injection, table-to-text, topic tags, xref)
+            → Chunk (parent-child) → Dedup → Dual embed → Write Qdrant + Postgres
+```
+No gate. Document is searchable seconds after upload.
+
+### Track B — Conditional (knowledge extraction)
+```
+If doc_class has ontology mapping:
+  Extract entities → Validate swarm (3 agents) → Gate → graph_write
+Else:
+  Skip Track B, log only
+```
+Validation gate:
+- `conf ≥ 0.85` + all 3 agents agree → `graph_write` MCP
+- `0.6 ≤ conf < 0.85` or disagreement → `quarantine_write` → human review
+- contradicts high-conf existing fact → `audit_log(REJECTED)`
+
+---
+
+## Graph-Search Cypher Generation Flags
+
+Three independent env-gated levers control the FalkorDB graph-search path. Effective only when `ENABLE_GRAPH_SEARCH=True`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `ENABLE_GRAPH_SEARCH` | `False` | Master switch for the whole graph-search path. When off, the orchestrator skips the Cypher LLM call entirely and relies on hybrid vector retrieval only. |
+| `ENABLE_SCHEMA_AWARE_CYPHER` | `True` | When on, the Cypher-gen system prompt is augmented with the live FalkorDB schema (node labels, relationship types, properties per label) plus schema-anchored few-shot examples. Falls back to the static prompt if introspection fails. |
+| `CYPHER_SCHEMA_CACHE_TTL_SECONDS` | `300` | Schema introspection runs at most once per TTL window per process. |
+| `ENABLE_CYPHER_SELF_HEALING` | `False` | When on, an invalid Cypher generation is re-prompted to the same LLM with the validator's rejection reason, up to `CYPHER_SELF_HEAL_MAX_ATTEMPTS` times. Each retry is another LLM round-trip — flip on when you have a bigger model and want max graph recall. |
+| `CYPHER_SELF_HEAL_MAX_ATTEMPTS` | `3` | Hard cap on Cypher generation attempts when self-healing is on. Per Neo4j's iterative-refinement research, most correction lands on attempt 2; 3 is the standard ceiling. |
+
+Recommended profiles:
+- **Small model (≤ 1B params, e.g. `qwen3.5:0.8b`):** `ENABLE_GRAPH_SEARCH=False`. The model can rarely produce valid Cypher; the extra LLM call is wasted compute.
+- **Medium model (~7B, e.g. `qwen2.5:7b`):** `ENABLE_GRAPH_SEARCH=True`, `ENABLE_SCHEMA_AWARE_CYPHER=True`, `ENABLE_CYPHER_SELF_HEALING=False`. Schema injection alone is usually enough.
+- **Large model (≥ 14B, GPU-backed):** Add `ENABLE_CYPHER_SELF_HEALING=True`. Latency cost is acceptable; recall improves on hard questions.
+
+Validation in [src/docai/orchestrator/engine.py](src/docai/orchestrator/engine.py) (`_normalise_generated_cypher`) is always read-only enforcement — write tokens (`CREATE`, `MERGE`, `DELETE`, `SET`, `REMOVE`, `DROP`, `DETACH`) are rejected regardless of which flags are on.
+
+---
+
+## MCP Tool Boundary
+
+Tools in the registry (Diagram 06) only access DOCUMENT stores and FalkorDB:
+
+| Tool group | Tools | Access |
+|---|---|---|
+| Retrieval | `semantic_search`, `get_parent_chunk`, `cross_ref_lookup` | doc Qdrant, Postgres |
+| Graph | `graph_query`, `entity_link`, `check_contradiction` | FalkorDB |
+| Validation | `verify_fact`, `ontology_check` | doc chunks, ontology |
+| Importance | `boost_importance`, `get_importance_history` | episodic Qdrant (write only, gated) |
+| Write | `graph_write`, `quarantine_write`, `audit_log` | FalkorDB, Postgres |
+
+`semantic_search` for conversation does NOT exist as an MCP tool. Conversation retrieval is orchestrator-direct.
+
+---
+
+## Deployment Topology (Diagram 04)
+
+| Node | Components | Resource |
+|---|---|---|
+| Edge | Nginx + TLS | CPU |
+| Application | FastAPI, async orchestrator, Celery workers | CPU |
+| MCP + Ruflo | Ruflo MCP server, MCP registry, doc ingestion agent swarm | CPU |
+| GPU | vLLM tiers 1/3, embedding service, **Chandra OCR 2** | GPU (A100/H100) |
+| Data | Redis, Qdrant, FalkorDB, PostgreSQL | CPU + storage |
+| Observability | Prometheus, Grafana, Langfuse | CPU |
+
+---
+
+## Versioning
+
+```yaml
+title: "01 — Request Flow (v2.3)"
+```
+
+- `v2.0` — MCP architecture introduced
+- `v2.1` — Importance + recency + usage scoring for conversation
+- `v2.2` — Access boundary enforced, document_chunks schema enriched
+- `v2.3` — Symmetric hybrid retrieval — dual embedding for conversation, re-ranker on both paths
+
+---
+
+## Changelog
+
+- **v2.3** — Conversation Qdrant now stores `dense + sparse` (was dense only). Diagram 01 conversation retrieval pipeline now matches document pipeline: Stage 1 recall → Stage 2 RRF fusion → Stage 3 BGE re-rank → Stage 4 composite scoring. Diagram 03 has new dual-embedding worker. Diagram 02 schemas updated.
+- **v2.2** — Access boundary made structural. Document stores MCP-only; conversation stores direct. Document chunk schema enriched (heading_prefix, doc_title, author, doc_type, language, topic_tags). Diagram 05 split into Track A (retrieval) and Track B (knowledge).
+- **v2.1** — Importance scoring + recency + usage signals + daily decay job.
+- **v2.0** — MCP architecture, dual-mode retrieval, tool registry (Diagram 06).
+- **v1.x** — Initial diagrams, framework removal.

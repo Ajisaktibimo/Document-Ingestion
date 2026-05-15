@@ -1,0 +1,174 @@
+---
+title: "Document Ingestion — Final Architecture (v2.3 / current build 2026-05)"
+---
+flowchart TB
+
+    %% ════════════════════════════════════════════════════════════
+    %%  EXTERNAL ACTORS
+    %% ════════════════════════════════════════════════════════════
+    USER([👤 User / Browser])
+    LLM_C([🤖 LLM])
+
+    %% ════════════════════════════════════════════════════════════
+    %%  EDGE
+    %% ════════════════════════════════════════════════════════════
+    subgraph EDGE["Edge"]
+        NGINX["Nginx · TLS"]
+    end
+
+    %% ════════════════════════════════════════════════════════════
+    %%  APPLICATION TIER
+    %% ════════════════════════════════════════════════════════════
+    subgraph APP["Application Tier — FastAPI :8000"]
+        direction TB
+        ROUTES["routes.py\n/upload · /chat · /sessions/*"]
+        ORCH["OrchestratorEngine\nhandle_query / handle_query_streaming"]
+        PIPE["IngestionPipeline\ningest_document (sync)"]
+        SESSIONS["Session Persistence\ncookie identity · auto-bootstrap\nsummarization (fire-and-forget)"]
+        STREAM["Streaming SSE\ntext/event-stream\ncitations · thinking_delta\ncontent_delta · done · error"]
+
+        ROUTES --> ORCH
+        ROUTES --> PIPE
+        ROUTES --> SESSIONS
+        ROUTES --> STREAM
+    end
+
+    %% ════════════════════════════════════════════════════════════
+    %%  MCP TIER
+    %% ════════════════════════════════════════════════════════════
+    subgraph MCP["MCP Tier — FastMCP :8010"]
+        direction TB
+        MCP_SVC["MCP Tool Server\nRuflo-hosted · JSON-RPC 2.0"]
+        TOOLS["Tool Registry\nsemantic_search · get_parent_chunk\ncross_ref_lookup · graph_query\nentity_link · check_contradiction\nverify_fact · ontology_check\nboost_importance · graph_write\nquarantine_write · audit_log"]
+        MCP_SVC --- TOOLS
+    end
+
+    %% ════════════════════════════════════════════════════════════
+    %%  LLM / OCR TIER
+    %% ════════════════════════════════════════════════════════════
+    subgraph AI["AI / Model Tier"]
+        direction LR
+        OLLAMA["Ollama :11434\nqwen3.5:0.8b / qwen2.5:7b+\nchat · cypher · summarization"]
+        OCR["Docling (default)\nRapidOCR ONNX models\nPDF · DOCX · HTML · XLSX"]
+        EMBED["Embedding Pipeline\nDense: nomic-embed-text-v2\nSparse: BM42\nReranker: BGE-reranker-v2-m3"]
+    end
+
+    %% ════════════════════════════════════════════════════════════
+    %%  DATA TIER
+    %% ════════════════════════════════════════════════════════════
+    subgraph DATA["Data Tier"]
+        direction TB
+
+        subgraph VECTOR["Vector Stores"]
+            direction LR
+            QDRANT_D[(Qdrant :6333\ndocument_chunks\ndense + sparse + payload)]
+            QDRANT_E[(Qdrant :6333\nepisodic_memory\nfuture — not yet wired)]
+        end
+
+        subgraph RELATIONAL["Relational Stores"]
+            direction LR
+            PG[(PostgreSQL :5432\ndoc_registry\nparent_chunks\nsessions · session_messages)]
+            PG_AUDIT[(PostgreSQL\naudit_log · cross_references)]
+        end
+
+        subgraph GRAPH["Graph Store (optional)"]
+            FALKOR[(FalkorDB :6380\ndocai_knowledge_graph\nENABLE_GRAPH_SEARCH=False)]
+        end
+
+        subgraph CACHE["Cache (provisioned, unused)"]
+            REDIS[(Redis :6381\nprovisioned — not yet wired)]
+        end
+    end
+
+    %% ════════════════════════════════════════════════════════════
+    %%  FRONTEND
+    %% ════════════════════════════════════════════════════════════
+    subgraph FE["Frontend — Vite/React :5174"]
+        direction TB
+        FE_UI["Web UI\ndrag-and-drop upload\nsession sidebar · chat panel\ncitations · thinking panel"]
+        FE_UX["UX Features\ninline rename · avatar initials\nmsg animations · empty states"]
+        FE_UI --- FE_UX
+    end
+
+    %% ════════════════════════════════════════════════════════════
+    %%  CONNECTIONS — USER FLOW
+    %% ════════════════════════════════════════════════════════════
+    USER -->|"HTTPS"| NGINX
+    NGINX -->|"WS / HTTP"| ROUTES
+    USER <-->|"static + XHR"| FE_UI
+    FE_UI -->|"XHR"| ROUTES
+
+    %% ════════════════════════════════════════════════════════════
+    %%  CONNECTIONS — UPLOAD PATH
+    %% ════════════════════════════════════════════════════════════
+    PIPE -->|"sha256 dedup\nstatus: ready/processing/failed"| PG
+    PIPE --> OCR
+    OCR --> EMBED
+    EMBED -->|"dense + sparse"| QDRANT_D
+    PIPE -->|"parent_chunks"| PG
+
+    %% ════════════════════════════════════════════════════════════
+    %%  CONNECTIONS — CHAT PATH
+    %% ════════════════════════════════════════════════════════════
+    ORCH -->|"pre-flight: doc statuses"| PG
+    ORCH -->|"hybrid retrieval\ndense + sparse → RRF → rerank"| QDRANT_D
+    ORCH -->|"Cypher (if enabled)\nread-only · self-healing"| FALKOR
+    ORCH -->|"prompt assembly +\nreason promotion"| LLM_C
+    LLM_C --> OLLAMA
+    ORCH -->|"session load/save/summarize"| SESSIONS
+    SESSIONS --> PG
+
+    %% ════════════════════════════════════════════════════════════
+    %%  CONNECTIONS — MCP PATH
+    %% ════════════════════════════════════════════════════════════
+    ORCH -.->|"direct (current build)"| FALKOR
+    MCP_SVC -.->|"MCP boundary (spec)"| QDRANT_D & PG & FALKOR & PG_AUDIT
+    TOOLS --> QDRANT_D & PG & FALKOR & PG_AUDIT
+
+    %% ════════════════════════════════════════════════════════════
+    %%  CONNECTIONS — STREAMING
+    %% ════════════════════════════════════════════════════════════
+    STREAM -->|"SSE events"| FE_UI
+
+    %% ════════════════════════════════════════════════════════════
+    %%  CONNECTIONS — HOST BINDS
+    %% ════════════════════════════════════════════════════════════
+    HOST_MODELS["./models/\nbind-mount\ndense_cache · sparse_cache\nrapidocr_cache · modelscope_cache"]
+    HOST_UPLOADS["./uploads/\nbind-mount\ntemp PDF storage"]
+    APP -.-> HOST_MODELS & HOST_UPLOADS
+    OLLAMA -.->|"host.docker.internal:11434"| APP
+
+    %% ════════════════════════════════════════════════════════════
+    %%  SPEC DIVERGENCES (current build vs v2.3 target)
+    %% ════════════════════════════════════════════════════════════
+    DIV["⚠ Spec divergences (v2.3 → current build):
+    • Track A async (Celery+Redis) → SYNC ingestion
+    • Track B knowledge extraction → NOT implemented
+    • Conversation memory (Redis+Qdrant episodic) → NOT wired
+    • vLLM → Ollama
+    • Chandra OCR 2 → Docling/RapidOCR
+    • FalkorDB MCP-only → direct orchestrator access
+    • Importance/recency/usage scoring → NOT implemented"]
+
+    %% ════════════════════════════════════════════════════════════
+    %%  STYLES
+    %% ════════════════════════════════════════════════════════════
+    classDef actor fill:#0d2a1f,stroke:#00f5c4,stroke-width:2px,color:#e2e8f0
+    classDef edge fill:#0d2a1f,stroke:#00f5c4,stroke-width:1px,color:#e2e8f0
+    classDef app fill:#1a0d2a,stroke:#7c3aed,stroke-width:2px,color:#e2e8f0
+    classDef mcp fill:#2a1a0d,stroke:#f97316,stroke-width:2px,color:#e2e8f0
+    classDef ai fill:#0d2a1f,stroke:#00f5c4,stroke-width:1px,color:#e2e8f0
+    classDef db fill:#0f172a,stroke:#475569,stroke-width:1px,color:#cbd5e1
+    classDef fe fill:#1a1a0d,stroke:#eab308,stroke-width:2px,color:#e2e8f0
+    classDef div fill:#2a0d0d,stroke:#ef4444,stroke-width:1px,color:#fca5a5
+    classDef host fill:#fff4e6,stroke:#d97706,stroke-dasharray:4 4
+
+    class USER,LLM_C actor
+    class NGINX edge
+    class ROUTES,ORCH,PIPE,SESSIONS,STREAM app
+    class MCP_SVC,TOOLS mcp
+    class OLLAMA,OCR,EMBED ai
+    class QDRANT_D,QDRANT_E,PG,PG_AUDIT,FALKOR,REDIS db
+    class FE_UI,FE_UX fe
+    class DIV div
+    class HOST_MODELS,HOST_UPLOADS host

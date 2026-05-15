@@ -1,0 +1,32 @@
+name: General Document Ontology (NexusRAG & Chandra 2 OCR)
+version: 1.0
+nodes:
+  # Structural Nodes (Inspired by Chandra 2 OCR)
+  - Document
+  - Page
+  - Section
+  - TextBlock
+  - Table
+  
+  # Semantic Nodes (Inspired by NexusRAG)
+  - Entity       # Person, Organization, Location, Event
+  - Concept      # Broad topics or semantic categories
+  - Claim        # Factual assertions or statements
+  - Metric       # Quantifiable data points (e.g., "$5M", "20%")
+
+edges:
+  # Structural Relationships
+  - [Document, HAS_PAGE, Page]
+  - [Page, HAS_SECTION, Section]
+  - [Section, CONTAINS_BLOCK, TextBlock]
+  - [Section, CONTAINS_TABLE, Table]
+
+  # Semantic Relationships
+  - [Entity, MENTIONED_IN, TextBlock]
+  - [Entity, ASSOCIATED_WITH, Concept]
+  - [Entity, PARTICIPATES_IN, Claim]
+  - [Claim, SUPPORTED_BY, TextBlock]
+  - [Claim, SUPPORTED_BY, Table]
+  - [Metric, BELONGS_TO, Entity]
+  - [Metric, FOUND_IN, TextBlock]
+  - [Metric, FOUND_IN, Table]

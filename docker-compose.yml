@@ -1,0 +1,336 @@
+services:
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: docai-redis
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - docai-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: docai-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - docai-net
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: docai-postgres
+    environment:
+      POSTGRES_USER: docai
+      POSTGRES_PASSWORD: docai
+      POSTGRES_DB: docai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - docai-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docai -d docai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: docai-falkordb
+    ports:
+      - "6380:6379"
+    volumes:
+      - falkordb_data:/data
+    networks:
+      - docai-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: docai-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - docai-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: ${NVIDIA_DRIVER:-nvidia}
+              count: ${GPU_RESERVATION_COUNT:-0}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: docai-ollama-init
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull ${OLLAMA_MODEL:-qwen3.5:0.8b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - docai-net
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      args:
+        - DOCUMENT_PARSER=${DOCUMENT_PARSER:-docling}
+        - DEVICE=${DEVICE:-cpu}
+        - DENSE_EMBEDDING_CPU_MODEL=${DENSE_EMBEDDING_CPU_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+        - DENSE_EMBEDDING_BACKEND=${DENSE_EMBEDDING_BACKEND:-onnx}
+    container_name: docai-api
+    ports:
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+      - torch_cache:/root/.cache/torch
+      - uv_cache:/root/.cache/uv
+      # Persist RapidOCR ONNX models across container lifecycles. RapidOCR
+      # 3.8 ignores RAPIDOCR_DOWNLOAD_DIR and hardcodes its cache to the
+      # library's site-packages dir — so we bind-mount a host directory
+      # directly over that path. First successful download populates
+      # ./models/rapidocr_cache/ on the host; every restart (or rebuild)
+      # mounts those files back in instead of re-downloading.
+      - ./models/rapidocr_cache:/opt/conda/lib/python3.11/site-packages/rapidocr/models
+    environment:
+      - BACKEND_PROFILE=local
+      # MODELSCOPE_CACHE: respected by the modelscope SDK if it's used
+      # for any download outside RapidOCR's own path. Harmless if ignored.
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
+      - DEVICE=${DEVICE:-cpu}
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
+      - POSTGRES_DSN=postgresql+asyncpg://docai:docai@postgres:5432/docai
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:0.8b}
+      - OLLAMA_REQUEST_TIMEOUT_SECONDS=${OLLAMA_REQUEST_TIMEOUT_SECONDS:-120}
+      - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-256}
+      - OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX:-1024}
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-5m}
+      - OLLAMA_THINK=${OLLAMA_THINK:-False}
+      - CHAT_OLLAMA_THINK=${CHAT_OLLAMA_THINK:-}
+      - INGESTION_OLLAMA_THINK=${INGESTION_OLLAMA_THINK:-True}
+      - GRAPH_SEARCH_TIMEOUT_SECONDS=${GRAPH_SEARCH_TIMEOUT_SECONDS:-10}
+      - ENABLE_GRAPH_SEARCH=${ENABLE_GRAPH_SEARCH:-False}
+      # Cypher generation tuning. Effective only when ENABLE_GRAPH_SEARCH=True.
+      # Schema-aware on by default; self-healing off (extra LLM calls).
+      - ENABLE_SCHEMA_AWARE_CYPHER=${ENABLE_SCHEMA_AWARE_CYPHER:-True}
+      - CYPHER_SCHEMA_CACHE_TTL_SECONDS=${CYPHER_SCHEMA_CACHE_TTL_SECONDS:-300}
+      - ENABLE_CYPHER_SELF_HEALING=${ENABLE_CYPHER_SELF_HEALING:-False}
+      - CYPHER_SELF_HEAL_MAX_ATTEMPTS=${CYPHER_SELF_HEAL_MAX_ATTEMPTS:-3}
+      - RAG_CONTEXT_CHUNK_MAX_CHARS=${RAG_CONTEXT_CHUNK_MAX_CHARS:-2200}
+      - RAG_CONTEXT_TOTAL_MAX_CHARS=${RAG_CONTEXT_TOTAL_MAX_CHARS:-5000}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-768}
+      - DENSE_MODEL_PATH=${DENSE_MODEL_PATH:-}
+      - DENSE_CACHE_DIR=${DENSE_CACHE_DIR:-/opt/dense_cache}
+      - DENSE_EMBEDDING_BACKEND=${DENSE_EMBEDDING_BACKEND:-onnx}
+      - DENSE_EMBEDDING_DEVICE=${DENSE_EMBEDDING_DEVICE:-cpu}
+      - DENSE_EMBEDDING_PROVIDERS=${DENSE_EMBEDDING_PROVIDERS:-CPUExecutionProvider}
+      - DENSE_EMBEDDING_DEVICE_IDS=${DENSE_EMBEDDING_DEVICE_IDS:-}
+      - DENSE_EMBEDDING_CPU_MODEL=${DENSE_EMBEDDING_CPU_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+      - DENSE_EMBEDDING_GPU_MODEL=${DENSE_EMBEDDING_GPU_MODEL:-nomic-ai/nomic-embed-text-v2-moe}
+      - DENSE_DOC_PREFIX=${DENSE_DOC_PREFIX:-}
+      - DENSE_QUERY_PREFIX=${DENSE_QUERY_PREFIX:-}
+      - SPARSE_CACHE_DIR=${SPARSE_CACHE_DIR:-/opt/sparse_cache}
+      - SPARSE_EMBEDDING_DEVICE=${SPARSE_EMBEDDING_DEVICE:-cpu}
+      - SPARSE_EMBEDDING_PROVIDERS=${SPARSE_EMBEDDING_PROVIDERS:-CPUExecutionProvider}
+      - SPARSE_EMBEDDING_DEVICE_IDS=${SPARSE_EMBEDDING_DEVICE_IDS:-}
+      - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      - RERANKER_MODEL_PATH=${RERANKER_MODEL_PATH:-}
+      - RERANKER_BACKEND=${RERANKER_BACKEND:-torch}
+      - RERANKER_DEVICE=${RERANKER_DEVICE:-cpu}
+      # Session persistence (sub-project 1)
+      - ENABLE_SESSION_PERSISTENCE=${ENABLE_SESSION_PERSISTENCE:-True}
+      - ENABLE_SESSION_SUMMARIZATION=${ENABLE_SESSION_SUMMARIZATION:-False}
+      - SESSION_WINDOW_MESSAGES=${SESSION_WINDOW_MESSAGES:-20}
+      - SUMMARIZATION_CADENCE_MESSAGES=${SUMMARIZATION_CADENCE_MESSAGES:-10}
+      - SUMMARIZATION_OLLAMA_MODEL=${SUMMARIZATION_OLLAMA_MODEL:-}
+      - SUMMARY_MAX_TOKENS=${SUMMARY_MAX_TOKENS:-300}
+      - SESSION_USER_ID_COOKIE=${SESSION_USER_ID_COOKIE:-docai_uid}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      falkordb:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    networks:
+      - docai-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: ${NVIDIA_DRIVER:-nvidia}
+              count: ${GPU_RESERVATION_COUNT:-0}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: python -m docai.api.server
+
+  mcp:
+    build:
+      context: .
+      args:
+        - DOCUMENT_PARSER=${DOCUMENT_PARSER:-docling}
+        - DEVICE=${DEVICE:-cpu}
+        - DENSE_EMBEDDING_CPU_MODEL=${DENSE_EMBEDDING_CPU_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+        - DENSE_EMBEDDING_BACKEND=${DENSE_EMBEDDING_BACKEND:-onnx}
+    container_name: docai-mcp
+    ports:
+      - "${MCP_PORT:-8010}:${MCP_PORT:-8010}"
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+      - torch_cache:/root/.cache/torch
+      - uv_cache:/root/.cache/uv
+      # Shared OCR-model cache — same bind mount as the api service.
+      - ./models/rapidocr_cache:/opt/conda/lib/python3.11/site-packages/rapidocr/models
+    environment:
+      - BACKEND_PROFILE=local
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
+      - DEVICE=${DEVICE:-cpu}
+      - REDIS_URL=redis://redis:6379
+      - QDRANT_URL=http://qdrant:6333
+      - POSTGRES_DSN=postgresql+asyncpg://docai:docai@postgres:5432/docai
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:0.8b}
+      - OLLAMA_REQUEST_TIMEOUT_SECONDS=${OLLAMA_REQUEST_TIMEOUT_SECONDS:-120}
+      - OLLAMA_NUM_PREDICT=${OLLAMA_NUM_PREDICT:-256}
+      - OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX:-1024}
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-5m}
+      - OLLAMA_THINK=${MCP_OLLAMA_THINK:-True}
+      - CHAT_OLLAMA_THINK=${MCP_CHAT_OLLAMA_THINK:-}
+      - INGESTION_OLLAMA_THINK=${MCP_INGESTION_OLLAMA_THINK:-True}
+      - GRAPH_SEARCH_TIMEOUT_SECONDS=${GRAPH_SEARCH_TIMEOUT_SECONDS:-10}
+      - ENABLE_GRAPH_SEARCH=${ENABLE_GRAPH_SEARCH:-False}
+      - ENABLE_SCHEMA_AWARE_CYPHER=${ENABLE_SCHEMA_AWARE_CYPHER:-True}
+      - CYPHER_SCHEMA_CACHE_TTL_SECONDS=${CYPHER_SCHEMA_CACHE_TTL_SECONDS:-300}
+      - ENABLE_CYPHER_SELF_HEALING=${ENABLE_CYPHER_SELF_HEALING:-False}
+      - CYPHER_SELF_HEAL_MAX_ATTEMPTS=${CYPHER_SELF_HEAL_MAX_ATTEMPTS:-3}
+      - RAG_CONTEXT_CHUNK_MAX_CHARS=${RAG_CONTEXT_CHUNK_MAX_CHARS:-2200}
+      - RAG_CONTEXT_TOTAL_MAX_CHARS=${RAG_CONTEXT_TOTAL_MAX_CHARS:-5000}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-768}
+      - DENSE_MODEL_PATH=${DENSE_MODEL_PATH:-}
+      - DENSE_CACHE_DIR=${DENSE_CACHE_DIR:-/opt/dense_cache}
+      - DENSE_EMBEDDING_BACKEND=${DENSE_EMBEDDING_BACKEND:-onnx}
+      - DENSE_EMBEDDING_DEVICE=${DENSE_EMBEDDING_DEVICE:-cpu}
+      - DENSE_EMBEDDING_PROVIDERS=${DENSE_EMBEDDING_PROVIDERS:-CPUExecutionProvider}
+      - DENSE_EMBEDDING_DEVICE_IDS=${DENSE_EMBEDDING_DEVICE_IDS:-}
+      - DENSE_EMBEDDING_CPU_MODEL=${DENSE_EMBEDDING_CPU_MODEL:-nomic-ai/nomic-embed-text-v1.5}
+      - DENSE_EMBEDDING_GPU_MODEL=${DENSE_EMBEDDING_GPU_MODEL:-nomic-ai/nomic-embed-text-v2-moe}
+      - DENSE_DOC_PREFIX=${DENSE_DOC_PREFIX:-}
+      - DENSE_QUERY_PREFIX=${DENSE_QUERY_PREFIX:-}
+      - SPARSE_CACHE_DIR=${SPARSE_CACHE_DIR:-/opt/sparse_cache}
+      - SPARSE_EMBEDDING_DEVICE=${SPARSE_EMBEDDING_DEVICE:-cpu}
+      - SPARSE_EMBEDDING_PROVIDERS=${SPARSE_EMBEDDING_PROVIDERS:-CPUExecutionProvider}
+      - SPARSE_EMBEDDING_DEVICE_IDS=${SPARSE_EMBEDDING_DEVICE_IDS:-}
+      - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      - RERANKER_MODEL_PATH=${RERANKER_MODEL_PATH:-}
+      - RERANKER_BACKEND=${RERANKER_BACKEND:-torch}
+      - RERANKER_DEVICE=${RERANKER_DEVICE:-cpu}
+      # Session persistence (sub-project 1)
+      - ENABLE_SESSION_PERSISTENCE=${ENABLE_SESSION_PERSISTENCE:-True}
+      - ENABLE_SESSION_SUMMARIZATION=${ENABLE_SESSION_SUMMARIZATION:-False}
+      - SESSION_WINDOW_MESSAGES=${SESSION_WINDOW_MESSAGES:-20}
+      - SUMMARIZATION_CADENCE_MESSAGES=${SUMMARIZATION_CADENCE_MESSAGES:-10}
+      - SUMMARIZATION_OLLAMA_MODEL=${SUMMARIZATION_OLLAMA_MODEL:-}
+      - SUMMARY_MAX_TOKENS=${SUMMARY_MAX_TOKENS:-300}
+      - SESSION_USER_ID_COOKIE=${SESSION_USER_ID_COOKIE:-docai_uid}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      qdrant:
+        condition: service_started
+      falkordb:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    networks:
+      - docai-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: ${NVIDIA_DRIVER:-nvidia}
+              count: ${GPU_RESERVATION_COUNT:-0}
+              capabilities: [gpu]
+    command: python -m docai.mcp.server
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: docai-frontend
+    ports:
+      - "5174:5174"
+    environment:
+      - API_URL=http://docai-api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - docai-net
+
+volumes:
+  redis_data:
+  qdrant_data:
+  postgres_data:
+  falkordb_data:
+  ollama_data:
+  hf_cache:
+  torch_cache:
+  uv_cache:
+
+networks:
+  docai-net:
+    driver: bridge

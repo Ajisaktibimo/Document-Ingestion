@@ -1,0 +1,3 @@
+[console_scripts]
+api = docai.api.server:start
+mcp = docai.mcp.server:main

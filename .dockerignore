@@ -1,0 +1,60 @@
+# Ignore Python virtual environment
+venv/
+.venv/
+env/
+.env
+
+# Ignore Python cache
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+.tox/
+
+# Ignore local models (Very Large - MUST IGNORE)
+models/
+**/models/
+**/hub/
+**/checkpoints/
+.cache/
+
+# Ignore data and documents (These should be bind-mounted, not in the image)
+data/
+**/data/
+outputs/
+**/outputs/
+uploads/
+**/uploads/
+storage/
+**/storage/
+*.db
+*.sqlite
+*.pdf
+*.docx
+*.doc
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+*.csv
+
+# Ignore IDE and OS files
+.git/
+.gitignore
+.dockerignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*.bak
+
+# Ignore build artifacts
+build/
+dist/
+*.egg-info/
+node_modules/
+.ipynb_checkpoints/
