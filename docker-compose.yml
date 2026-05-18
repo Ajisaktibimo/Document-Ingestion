@@ -215,11 +215,6 @@ services:
             - driver: ${NVIDIA_DRIVER:-nvidia}
               count: ${GPU_RESERVATION_COUNT:-0}
               capabilities: [gpu]
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     command: python -m docai.api.server
 
   mcp:
