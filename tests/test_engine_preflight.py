@@ -197,6 +197,69 @@ async def test_handle_query_all_scoped_docs_processing_short_circuits(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_handle_query_session_scoped_processing_doc_short_circuits(monkeypatch) -> None:
+    engine, engine_module = _make_engine(monkeypatch)
+    DocStatus = engine_module.DocStatus
+
+    doc_id = uuid.uuid4()
+    engine._session_doc_ids["s1"] = [str(doc_id)]
+    statuses = [
+        DocStatus(doc_id=doc_id, filename="pending.pdf", status="processing", error_message=None),
+    ]
+    fetch_mock, gather_mock, llm_mock = _patch_engine_for_handle_query(
+        engine, engine_module, monkeypatch,
+        statuses=statuses,
+        llm_result={"content": "should not be used", "thinking": ""},
+    )
+
+    result = await engine.handle_query("what is this doc about?", session_id="s1")
+
+    assert fetch_mock.await_count == 1
+    assert gather_mock.await_count == 0
+    assert llm_mock.await_count == 0
+    assert result["guard"] == "all_scoped_docs_unavailable"
+    assert "pending.pdf" in result["response"]
+    assert "still being indexed" in result["response"]
+    assert result["citations"] == []
+
+
+@pytest.mark.asyncio
+async def test_handle_query_completed_doc_with_zero_chunks_short_circuits(monkeypatch) -> None:
+    engine, engine_module = _make_engine(monkeypatch)
+    DocStatus = engine_module.DocStatus
+
+    doc_id = uuid.uuid4()
+    statuses = [
+        DocStatus(
+            doc_id=doc_id,
+            filename="empty.pdf",
+            status="completed",
+            error_message=None,
+            chunk_count=0,
+        ),
+    ]
+    fetch_mock, gather_mock, llm_mock = _patch_engine_for_handle_query(
+        engine, engine_module, monkeypatch,
+        statuses=statuses,
+        llm_result={"content": "should not be used", "thinking": ""},
+    )
+
+    result = await engine.handle_query(
+        "what is this doc about?",
+        session_id="s1",
+        doc_ids=[str(doc_id)],
+    )
+
+    assert fetch_mock.await_count == 1
+    assert gather_mock.await_count == 0
+    assert llm_mock.await_count == 0
+    assert result["guard"] == "all_scoped_docs_unavailable"
+    assert "empty.pdf" in result["response"]
+    assert "still being indexed" in result["response"]
+    assert result["citations"] == []
+
+
+@pytest.mark.asyncio
 async def test_handle_query_mixed_scope_falls_back_to_completed_only(monkeypatch) -> None:
     engine, engine_module = _make_engine(monkeypatch)
     DocStatus = engine_module.DocStatus

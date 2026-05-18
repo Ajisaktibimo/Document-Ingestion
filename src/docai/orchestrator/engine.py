@@ -40,6 +40,13 @@ class DocStatus:
     filename: str
     status: str
     error_message: str | None
+    chunk_count: int | None = None
+
+
+def _doc_status_is_ready(doc_status: DocStatus) -> bool:
+    if doc_status.status != "completed":
+        return False
+    return doc_status.chunk_count is None or doc_status.chunk_count > 0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -672,9 +679,16 @@ class OrchestratorEngine:
             try:
                 rows = await conn.fetch(
                     '''
-                    SELECT doc_id, filename, status, error_message
-                    FROM doc_registry
-                    WHERE doc_id = ANY($1::uuid[])
+                    SELECT
+                        d.doc_id,
+                        d.filename,
+                        d.status,
+                        d.error_message,
+                        COUNT(p.parent_id)::int AS chunk_count
+                    FROM doc_registry d
+                    LEFT JOIN parent_chunks p ON p.doc_id = d.doc_id
+                    WHERE d.doc_id = ANY($1::uuid[])
+                    GROUP BY d.doc_id, d.filename, d.status, d.error_message
                     ''',
                     doc_ids,
                 )
@@ -684,15 +698,22 @@ class OrchestratorEngine:
             logger.warning("Failed to fetch doc statuses: %s", e)
             return []
 
-        return [
-            DocStatus(
-                doc_id=row["doc_id"],
-                filename=row["filename"],
-                status=row["status"],
-                error_message=row["error_message"],
+        statuses = []
+        for row in rows:
+            try:
+                chunk_count = row["chunk_count"]
+            except (KeyError, IndexError):
+                chunk_count = None
+            statuses.append(
+                DocStatus(
+                    doc_id=row["doc_id"],
+                    filename=row["filename"],
+                    status=row["status"],
+                    error_message=row["error_message"],
+                    chunk_count=chunk_count,
+                )
             )
-            for row in rows
-        ]
+        return statuses
 
     async def _fetch_session(
         self,
@@ -1269,26 +1290,29 @@ class OrchestratorEngine:
                 doc_ids = [str(d) for d in session_row["doc_ids"]]
 
         explicit_doc_ids = self._normalise_doc_ids(doc_ids)
+        preflight_doc_ids = explicit_doc_ids
+        if doc_ids is None and not preflight_doc_ids:
+            preflight_doc_ids = self._session_scope(session_id)
 
-        # Pre-flight (Task T2): if the caller pinned an explicit scope, verify
+        # Pre-flight (Task T2): if the caller pinned or remembered a scope, verify
         # those documents are actually ready before doing retrieval/LLM work.
         excluded: List[DocStatus] = []
         missing_ids: List[str] = []
         doc_uuids: list[uuid.UUID] = []
-        if explicit_doc_ids:
+        if preflight_doc_ids:
             try:
-                doc_uuids = [uuid.UUID(d) for d in explicit_doc_ids]
+                doc_uuids = [uuid.UUID(d) for d in preflight_doc_ids]
             except (ValueError, TypeError) as e:
                 logger.warning(
-                    "Skipping pre-flight: invalid UUID in explicit_doc_ids (%s)", e
+                    "Skipping pre-flight: invalid UUID in active doc scope (%s)", e
                 )
                 doc_uuids = []
-        if explicit_doc_ids and doc_uuids:
+        if preflight_doc_ids and doc_uuids:
             statuses = await self._fetch_doc_statuses(doc_uuids)
             known_ids = {str(s.doc_id) for s in statuses}
-            missing_ids = [d for d in explicit_doc_ids if d not in known_ids]
-            usable_ids = [str(s.doc_id) for s in statuses if s.status == "completed"]
-            excluded = [s for s in statuses if s.status != "completed"]
+            missing_ids = [d for d in preflight_doc_ids if d not in known_ids]
+            usable_ids = [str(s.doc_id) for s in statuses if _doc_status_is_ready(s)]
+            excluded = [s for s in statuses if not _doc_status_is_ready(s)]
 
             # All scoped docs unavailable → short-circuit with a human message.
             if not usable_ids and (excluded or missing_ids):
@@ -1300,7 +1324,9 @@ class OrchestratorEngine:
                 ]
                 parts = ["None of the requested documents are ready yet."]
                 if indexing:
-                    parts.append(f"Indexing: {', '.join(indexing)}.")
+                    parts.append(
+                        f"Indexing: {', '.join(indexing)} still being indexed."
+                    )
                 if failed:
                     parts.append(f"Failed: {', '.join(failed)}.")
                 if missing_ids:
@@ -1318,11 +1344,11 @@ class OrchestratorEngine:
             # LLM returns so we don't bias generation. Use set comparison —
             # ``_fetch_doc_statuses`` SQL has no ORDER BY, so two equal sets
             # in different orders must NOT trigger the subset branch.
-            if set(usable_ids) != set(explicit_doc_ids):
-                explicit_doc_ids = usable_ids
+            if set(usable_ids) != set(preflight_doc_ids):
+                preflight_doc_ids = usable_ids
 
-        active_doc_ids = explicit_doc_ids
-        if doc_ids is None:
+        active_doc_ids = preflight_doc_ids
+        if doc_ids is None and not active_doc_ids:
             active_doc_ids = self._session_scope(session_id)
 
         if session_ctx is not None and settings.ENABLE_SESSION_PERSISTENCE:
@@ -1461,11 +1487,10 @@ class OrchestratorEngine:
         # Partial-scope exclusion note (Task T2 step 3): if pre-flight
         # dropped some requested docs, surface that to the user up front.
         # By construction, when ``excluded`` or ``missing_ids`` is non-empty
-        # we either short-circuited above or kept ``explicit_doc_ids =
-        # usable_ids`` (non-empty), so a separate guard on
-        # ``explicit_doc_ids`` is dead.
+        # we either short-circuited above or kept only ready docs, so a separate
+        # guard on the active scope is dead.
         if excluded or missing_ids:
-            indexing_names = [s.filename for s in excluded if s.status == "processing"]
+            indexing_names = [s.filename for s in excluded if s.status != "failed"]
             failed_names = [s.filename for s in excluded if s.status == "failed"]
             parts = []
             if indexing_names:

@@ -49,7 +49,9 @@ class Settings(BaseSettings):
     ENABLE_IMAGE_CAPTIONING: bool = True
     CAPTION_VISION_MODEL: str = ""              # If empty, reuses OLLAMA_MODEL (for multimodal)
     MAX_IMAGES_PER_DOC: int = 10
+    MAX_TABLES_PER_DOC: int = 25
     MAX_TABLE_MARKDOWN_CHARS: int = 3000
+    INGESTION_MAX_CONCURRENT_TASKS: int = 1
 
     # Retrieval tuning
     VECTOR_PREFETCH_K: int = 20                 # Over-fetch before reranking

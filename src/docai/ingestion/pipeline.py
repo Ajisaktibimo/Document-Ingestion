@@ -21,15 +21,111 @@ from docai.retrieval.qdrant_client import QdrantStore
 
 logger = logging.getLogger(__name__)
 
+# Strong references to in-flight background tasks so they can't be GC'd.
+_active_tasks: set[asyncio.Task] = set()
+_ingestion_semaphore: Optional[asyncio.Semaphore] = None
+_ingestion_semaphore_limit: int = 0
+
+
+def _get_ingestion_semaphore() -> asyncio.Semaphore:
+    """Limit memory-heavy OCR/embed work across uploads in this API process."""
+    global _ingestion_semaphore, _ingestion_semaphore_limit
+    limit = max(1, settings.INGESTION_MAX_CONCURRENT_TASKS)
+    if _ingestion_semaphore is None or _ingestion_semaphore_limit != limit:
+        _ingestion_semaphore = asyncio.Semaphore(limit)
+        _ingestion_semaphore_limit = limit
+    return _ingestion_semaphore
 
 class IngestionPipeline:
     def __init__(self):
-        self.ocr_service = get_ocr_service()
-        self.captioner = get_captioner()
-        self.dense_embedder = get_dense_embedder()
-        self.sparse_embedder = get_sparse_embedder()
-        self.chunker = HierarchicalChunker()
-        self.qdrant_store = QdrantStore()
+        # Heavy services are loaded lazily so an upload request can register
+        # quickly without duplicating model stacks while another ingest runs.
+        self._ocr_service = None
+        self._captioner = None
+        self._dense_embedder = None
+        self._sparse_embedder = None
+        self._chunker = None
+        self._qdrant_store = None
+
+    @property
+    def ocr_service(self):
+        if self._ocr_service is None:
+            self._ocr_service = get_ocr_service()
+        return self._ocr_service
+
+    @ocr_service.setter
+    def ocr_service(self, value):
+        self._ocr_service = value
+
+    @property
+    def captioner(self):
+        if self._captioner is None:
+            self._captioner = get_captioner()
+        return self._captioner
+
+    @captioner.setter
+    def captioner(self, value):
+        self._captioner = value
+
+    @property
+    def dense_embedder(self):
+        if self._dense_embedder is None:
+            self._dense_embedder = get_dense_embedder()
+        return self._dense_embedder
+
+    @dense_embedder.setter
+    def dense_embedder(self, value):
+        self._dense_embedder = value
+
+    @property
+    def sparse_embedder(self):
+        if self._sparse_embedder is None:
+            self._sparse_embedder = get_sparse_embedder()
+        return self._sparse_embedder
+
+    @sparse_embedder.setter
+    def sparse_embedder(self, value):
+        self._sparse_embedder = value
+
+    @property
+    def chunker(self):
+        if self._chunker is None:
+            self._chunker = HierarchicalChunker()
+        return self._chunker
+
+    @chunker.setter
+    def chunker(self, value):
+        self._chunker = value
+
+    @property
+    def qdrant_store(self):
+        if self._qdrant_store is None:
+            self._qdrant_store = QdrantStore()
+        return self._qdrant_store
+
+    @qdrant_store.setter
+    def qdrant_store(self, value):
+        self._qdrant_store = value
+
+    @staticmethod
+    def _caption_candidates(ocr_result):
+        max_images = max(0, settings.MAX_IMAGES_PER_DOC)
+        max_tables = max(0, settings.MAX_TABLES_PER_DOC)
+        images = list(ocr_result.images[:max_images])
+        tables = list(ocr_result.tables[:max_tables])
+        skipped = (
+            max(0, len(ocr_result.images) - len(images))
+            + max(0, len(ocr_result.tables) - len(tables))
+        )
+        if skipped:
+            logger.warning(
+                "Skipping captioning for %d media items beyond configured limits "
+                "(MAX_IMAGES_PER_DOC=%d, MAX_TABLES_PER_DOC=%d).",
+                skipped,
+                max_images,
+                max_tables,
+            )
+        return images + tables
 
     def _get_file_hash(self, file_path: str) -> str:
         hasher = hashlib.sha256()
@@ -160,6 +256,25 @@ class IngestionPipeline:
         filename: str,
     ) -> None:
         """Background task: OCR → caption → chunk → embed → Postgres + Qdrant."""
+        semaphore = _get_ingestion_semaphore()
+        if semaphore.locked():
+            logger.info(
+                "Ingestion queued for doc_id=%s; max concurrent ingestion tasks is %d.",
+                doc_id,
+                settings.INGESTION_MAX_CONCURRENT_TASKS,
+            )
+
+        async with semaphore:
+            await self._run_pipeline_unlocked(file_path, doc_id, file_hash, filename)
+
+    async def _run_pipeline_unlocked(
+        self,
+        file_path: str,
+        doc_id: uuid.UUID,
+        file_hash: str,
+        filename: str,
+    ) -> None:
+        """Run one ingestion job after concurrency admission."""
         logger.info("Background ingestion started for doc_id=%s (%s)", doc_id, filename)
         dsn = settings.POSTGRES_DSN.replace("postgresql+asyncpg://", "postgresql://")
         conn = None
@@ -171,7 +286,7 @@ class IngestionPipeline:
             ocr_result = await self.ocr_service.process_document(file_path)
 
             # 2. Caption images and tables
-            all_media = ocr_result.images + ocr_result.tables
+            all_media = self._caption_candidates(ocr_result)
             if all_media:
                 logger.info("Captioning %d media items with local LLM...", len(all_media))
                 await self.captioner.caption_all(all_media)
