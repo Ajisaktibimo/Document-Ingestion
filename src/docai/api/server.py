@@ -8,6 +8,7 @@ import os
 import asyncio
 from docai.config import settings
 from docai.api.schema_bootstrap import bootstrap_schema
+from docai.ingestion.recovery import mark_interrupted_ingestions_failed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,6 +39,17 @@ async def lifespan(app: FastAPI):
 
     # Qdrant collections — best effort. The init_qdrant function logs its
     # own status; we just guard against any unexpected raise.
+    try:
+        interrupted = await mark_interrupted_ingestions_failed(settings.POSTGRES_DSN)
+        if interrupted:
+            logger.warning(
+                "Recovered %d interrupted ingestion task(s): %s",
+                len(interrupted),
+                ", ".join(str(row.get("filename")) for row in interrupted),
+            )
+    except Exception as e:
+        logger.warning("Interrupted ingestion recovery failed: %s", e)
+
     try:
         import sys
         from pathlib import Path

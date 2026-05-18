@@ -12,6 +12,7 @@ import logging
 import hashlib
 import os
 import asyncpg
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Optional
 from docai.config import settings
@@ -127,6 +128,50 @@ class IngestionPipeline:
             )
         return images + tables
 
+    @staticmethod
+    async def _mark_stage(conn: asyncpg.Connection, doc_id: uuid.UUID, stage: str) -> None:
+        await conn.execute(
+            """UPDATE doc_registry
+               SET ingestion_stage=$2,
+                   ingestion_heartbeat_at=NOW(),
+                   updated_at=NOW()
+               WHERE doc_id=$1 AND status='processing'""",
+            doc_id,
+            stage,
+        )
+
+    async def _mark_stage_with_new_connection(self, doc_id: uuid.UUID, stage: str) -> None:
+        dsn = settings.POSTGRES_DSN.replace("postgresql+asyncpg://", "postgresql://")
+        conn = None
+        try:
+            conn = await asyncpg.connect(dsn)
+            await self._mark_stage(conn, doc_id, stage)
+        except Exception as e:
+            logger.warning("Failed to heartbeat ingestion stage=%s doc_id=%s: %s", stage, doc_id, e)
+        finally:
+            if conn is not None:
+                await conn.close()
+
+    async def _heartbeat_stage(self, doc_id: uuid.UUID, stage: str) -> None:
+        interval = settings.INGESTION_HEARTBEAT_INTERVAL_SECONDS
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            await self._mark_stage_with_new_connection(doc_id, stage)
+
+    async def _run_with_heartbeat(self, conn, doc_id: uuid.UUID, stage: str, operation):
+        await self._mark_stage(conn, doc_id, stage)
+        heartbeat_task = asyncio.create_task(self._heartbeat_stage(doc_id, stage))
+        try:
+            if callable(operation):
+                operation = operation()
+            return await operation
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
     def _get_file_hash(self, file_path: str) -> str:
         hasher = hashlib.sha256()
         with open(file_path, 'rb') as f:
@@ -195,7 +240,8 @@ class IngestionPipeline:
             await conn.execute(
                 """UPDATE doc_registry
                    SET filename=$2, doc_class=$3, status='processing',
-                       error_message=NULL, updated_at=NOW()
+                       error_message=NULL, ingestion_stage='queued',
+                       ingestion_heartbeat_at=NOW(), updated_at=NOW()
                    WHERE file_hash=$1""",
                 file_hash, filename, doc_class,
             )
@@ -203,8 +249,10 @@ class IngestionPipeline:
             doc_id = uuid.uuid4()
             await conn.execute(
                 """INSERT INTO doc_registry
-                       (doc_id, file_hash, filename, doc_class, status, error_message, updated_at)
-                   VALUES ($1, $2, $3, $4, 'processing', NULL, NOW())""",
+                       (doc_id, file_hash, filename, doc_class, status, error_message,
+                        ingestion_stage, ingestion_heartbeat_at, updated_at)
+                   VALUES ($1, $2, $3, $4, 'processing', NULL,
+                           'queued', NOW(), NOW())""",
                 doc_id, file_hash, filename, doc_class,
             )
 
@@ -242,9 +290,11 @@ class IngestionPipeline:
                 await conn.close()
 
         if not already_done:
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._run_pipeline(file_path, doc_id, file_hash, filename)
             )
+            _active_tasks.add(task)
+            task.add_done_callback(_active_tasks.discard)
 
         return doc_id
 
@@ -280,28 +330,51 @@ class IngestionPipeline:
         conn = None
         try:
             conn = await asyncpg.connect(dsn)
+            await self._mark_stage(conn, doc_id, "starting")
 
             # 1. OCR / Structural Extraction
             logger.info("Extracting text via %s parser...", settings.DOCUMENT_PARSER)
-            ocr_result = await self.ocr_service.process_document(file_path)
+            ocr_result = await self._run_with_heartbeat(
+                conn,
+                doc_id,
+                "ocr",
+                lambda: self.ocr_service.process_document(file_path),
+            )
 
             # 2. Caption images and tables
             all_media = self._caption_candidates(ocr_result)
             if all_media:
                 logger.info("Captioning %d media items with local LLM...", len(all_media))
-                await self.captioner.caption_all(all_media)
+                await self._run_with_heartbeat(
+                    conn,
+                    doc_id,
+                    "captioning",
+                    lambda: self.captioner.caption_all(all_media),
+                )
 
             # 3. Chunk
+            await self._mark_stage(conn, doc_id, "chunking")
             logger.info("Chunking document...")
             chunks = self.chunker.chunk_document(ocr_result)
 
             # 4. Embed
             logger.info("Embedding %d chunks...", len(chunks))
             texts = [c.text for c in chunks]
-            dense_vectors = await self.dense_embedder.embed_documents(texts)
-            sparse_vectors = await self.sparse_embedder.embed_documents(texts)
+            dense_vectors = await self._run_with_heartbeat(
+                conn,
+                doc_id,
+                "dense_embedding",
+                lambda: self.dense_embedder.embed_documents(texts),
+            )
+            sparse_vectors = await self._run_with_heartbeat(
+                conn,
+                doc_id,
+                "sparse_embedding",
+                lambda: self.sparse_embedder.embed_documents(texts),
+            )
 
-            # 5. Postgres insert + mark completed (atomic)
+            # 5. Postgres insert (atomic)
+            await self._mark_stage(conn, doc_id, "postgres_insert")
             logger.info("Inserting into Postgres...")
             parent_ids = [uuid.uuid4() for _ in chunks]
             async with conn.transaction():
@@ -310,10 +383,6 @@ class IngestionPipeline:
                         'INSERT INTO parent_chunks (parent_id, doc_id, heading, full_text, page_num) VALUES ($1,$2,$3,$4,$5)',
                         parent_ids[i], doc_id, chunk.heading, chunk.text, chunk.page_num,
                     )
-                await conn.execute(
-                    "UPDATE doc_registry SET status='completed', page_count=$2 WHERE doc_id=$1",
-                    doc_id, ocr_result.page_count,
-                )
 
             # 6. Qdrant insert (after Postgres commits)
             logger.info("Inserting into Qdrant...")
@@ -329,13 +398,29 @@ class IngestionPipeline:
                 }
                 for chunk in chunks
             ]
-            await self.qdrant_store.insert_chunks(
-                parent_ids=parent_ids,
-                doc_ids=[doc_id] * len(chunks),
-                texts=texts,
-                dense_vectors=dense_vectors,
-                sparse_vectors=sparse_vectors,
-                extra_payloads=payloads,
+            await self._run_with_heartbeat(
+                conn,
+                doc_id,
+                "qdrant_insert",
+                lambda: self.qdrant_store.insert_chunks(
+                    parent_ids=parent_ids,
+                    doc_ids=[doc_id] * len(chunks),
+                    texts=texts,
+                    dense_vectors=dense_vectors,
+                    sparse_vectors=sparse_vectors,
+                    extra_payloads=payloads,
+                ),
+            )
+            await conn.execute(
+                """UPDATE doc_registry
+                   SET status='completed',
+                       page_count=$2,
+                       ingestion_stage='completed',
+                       ingestion_heartbeat_at=NOW(),
+                       updated_at=NOW()
+                   WHERE doc_id=$1""",
+                doc_id,
+                ocr_result.page_count,
             )
             logger.info("Ingestion complete for doc_id=%s", doc_id)
 
@@ -344,7 +429,13 @@ class IngestionPipeline:
             try:
                 if conn:
                     await conn.execute(
-                        "UPDATE doc_registry SET status='failed', error_message=$2, updated_at=NOW() WHERE file_hash=$1",
+                        """UPDATE doc_registry
+                           SET status='failed',
+                               error_message=$2,
+                               ingestion_stage='failed',
+                               ingestion_heartbeat_at=NOW(),
+                               updated_at=NOW()
+                           WHERE file_hash=$1""",
                         file_hash, str(e)[:2000],
                     )
             except Exception as db_err:

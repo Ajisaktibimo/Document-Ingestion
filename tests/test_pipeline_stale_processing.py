@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 import uuid
+import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,8 +37,15 @@ def _make_pipeline(monkeypatch):
     sys.modules.pop("docai.ingestion.pipeline", None)
     import importlib
     pipeline_module = importlib.import_module("docai.ingestion.pipeline")
+    pipeline_module._active_tasks.clear()
     pipeline = pipeline_module.IngestionPipeline()
     return pipeline, pipeline_module
+
+
+async def _await_background_tasks(pipeline_module):
+    tasks = list(pipeline_module._active_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 def _make_temp_file() -> str:
@@ -95,12 +103,14 @@ async def test_stale_null_updated_at_triggers_reingestion(monkeypatch) -> None:
     tmp = _make_temp_file()
     try:
         result = await pipeline.ingest_document(tmp, doc_class="general")
+        await _await_background_tasks(pipeline_module)
     finally:
         os.unlink(tmp)
 
     assert ocr_called, "OCR was not called — stale-processing did NOT fall through to retry"
-    # OCR raised → result is None per existing failure-handling contract.
-    assert result is None
+    # Registration still returns immediately; the background task records the
+    # OCR failure separately.
+    assert result == existing_row["doc_id"]
 
 
 @pytest.mark.asyncio
@@ -134,6 +144,7 @@ async def test_stale_old_updated_at_triggers_reingestion(monkeypatch) -> None:
     tmp = _make_temp_file()
     try:
         await pipeline.ingest_document(tmp, doc_class="general")
+        await _await_background_tasks(pipeline_module)
     finally:
         os.unlink(tmp)
 

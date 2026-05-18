@@ -2,6 +2,7 @@ export interface Session {
   session_id: string;
   title: string;
   doc_ids: string[];
+  message_count?: number;
   created_at: string;
   updated_at: string;
 }
@@ -12,6 +13,9 @@ export interface Document {
   status: DocumentStatus;
   created_at: string;
   updated_at: string;
+  ingestion_stage?: string | null;
+  ingestion_heartbeat_at?: string | null;
+  error_message?: string | null;
   page_count?: number;
   chunk_count: number;
   parser_version?: string;

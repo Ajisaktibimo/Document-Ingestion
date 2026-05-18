@@ -108,6 +108,7 @@ class Settings(BaseSettings):
     # it failed, and re-ingest. Prevents orphan rows from a crashed
     # ingestion permanently bricking re-uploads of the same file_hash.
     STALE_PROCESSING_THRESHOLD_SECONDS: float = 600.0
+    INGESTION_HEARTBEAT_INTERVAL_SECONDS: float = 15.0
 
     # ── Session persistence (sub-project 1) ────────────────────────────
     # Master switch. When False, /api/v1/sessions endpoints return 503

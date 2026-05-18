@@ -14,7 +14,7 @@ export function SessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const queryClient = useQueryClient();
 
-  const { data: session } = useSession(sessionId);
+  const { data: session } = useSession(sessionId ?? null);
   const patchSession = usePatchSession();
 
   const { selectedDoc, selectDoc, reset: resetStore } = useSessionStore();
@@ -107,9 +107,7 @@ export function SessionPage() {
         session={session ?? null}
       />
 
-      <VisualPanel
-        sessionId={sessionId || ""}
-      />
+      <VisualPanel />
     </div>
   );
 }

@@ -117,6 +117,7 @@ export const DataPanel = memo(function DataPanel({
             const isSelected = selectedDocId === doc.id;
             const isInSession = session?.doc_ids?.includes(doc.id);
             const isProcessing = doc.status === "processing" || doc.status === "parsing";
+            const stageLabel = doc.ingestion_stage?.replace(/_/g, " ");
 
             return (
               <div
@@ -135,8 +136,18 @@ export const DataPanel = memo(function DataPanel({
                       {doc.original_filename}
                     </p>
                     <p className="text-[10px] text-muted-foreground mt-1 uppercase tracking-wider">
-                      {doc.status} • {new Date(doc.created_at).toLocaleDateString()}
+                      {doc.status}{stageLabel ? ` / ${stageLabel}` : ""} / {new Date(doc.created_at).toLocaleDateString()}
                     </p>
+                    {isProcessing && doc.ingestion_heartbeat_at && (
+                      <p className="text-[10px] text-muted-foreground/80 mt-1">
+                        Updated {new Date(doc.ingestion_heartbeat_at).toLocaleTimeString()}
+                      </p>
+                    )}
+                    {doc.status === "failed" && doc.error_message && (
+                      <p className="text-[10px] text-destructive mt-1 line-clamp-2">
+                        {doc.error_message}
+                      </p>
+                    )}
                   </div>
                   
                   <div className="flex items-center gap-1">

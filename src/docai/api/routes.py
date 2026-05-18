@@ -103,6 +103,7 @@ async def list_documents(
         rows = await conn.fetch(
             """
             SELECT doc_id, filename, status, page_count, created_at, updated_at,
+                   ingestion_stage, ingestion_heartbeat_at, error_message,
                    (SELECT COUNT(*) FROM parent_chunks WHERE doc_id = doc_registry.doc_id) as chunk_count
             FROM doc_registry
             ORDER BY created_at DESC
@@ -115,6 +116,12 @@ async def list_documents(
                 "status": r["status"] if r["status"] != "completed" else "indexed",
                 "page_count": r["page_count"],
                 "chunk_count": r["chunk_count"],
+                "ingestion_stage": r["ingestion_stage"],
+                "ingestion_heartbeat_at": (
+                    r["ingestion_heartbeat_at"].isoformat()
+                    if r["ingestion_heartbeat_at"] else None
+                ),
+                "error_message": r["error_message"],
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                 "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
             }

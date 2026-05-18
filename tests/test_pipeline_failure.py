@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import types
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -38,8 +39,15 @@ def _make_pipeline(monkeypatch):
     sys.modules.pop("docai.ingestion.pipeline", None)
     import importlib
     pipeline_module = importlib.import_module("docai.ingestion.pipeline")
+    pipeline_module._active_tasks.clear()
     pipeline = pipeline_module.IngestionPipeline()
     return pipeline, pipeline_module
+
+
+async def _await_background_tasks(pipeline_module):
+    tasks = list(pipeline_module._active_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 def _make_temp_file() -> str:
@@ -93,11 +101,13 @@ async def test_failure_records_error_message_and_updated_at(monkeypatch) -> None
     tmp = _make_temp_file()
     try:
         result = await pipeline.ingest_document(tmp, doc_class="general")
+        await _await_background_tasks(pipeline_module)
     finally:
         os.unlink(tmp)
 
-    # The exception handler returns None and does NOT re-raise (existing behavior).
-    assert result is None
+    # Upload registration returns immediately; ingestion failure is recorded
+    # asynchronously by the background task.
+    assert result is not None
 
     # Find the failure UPDATE.
     failure_updates = [
@@ -121,8 +131,9 @@ async def test_failure_records_error_message_and_updated_at(monkeypatch) -> None
         for a in args
     ), f"bound args don't carry the error message: {args}"
 
-    # Connection still closed.
-    assert fake_conn.close.await_count == 1
+    # The test reuses one fake connection for registration and background
+    # ingestion; every connect call should still be matched by close.
+    assert fake_conn.close.await_count == connect_mock.await_count
 
 
 @pytest.mark.asyncio
@@ -162,15 +173,16 @@ async def test_failure_recording_db_error_does_not_mask_original(
 
     tmp = _make_temp_file()
     try:
-        # The pipeline's outer handler returns None on failure (current
-        # shape). The CRITICAL property under test: the secondary DB error
-        # must NOT escape and mask the original error.
+        # Ingestion now runs in the background. The critical property under
+        # test: the secondary DB error must NOT escape and mask the original
+        # error in that task.
         caplog.set_level("ERROR")
         result = await pipeline.ingest_document(tmp, doc_class="general")
+        await _await_background_tasks(pipeline_module)
     finally:
         os.unlink(tmp)
 
-    assert result is None
+    assert result is not None
 
     # The failure UPDATE was attempted (proves we reached the handler).
     failure_attempts = [
@@ -190,8 +202,9 @@ async def test_failure_recording_db_error_does_not_mask_original(
         f"original error should still be logged. captured logs: {log_text}"
     )
 
-    # Connection still closed even when failure-recording threw.
-    assert fake_conn.close.await_count == 1
+    # The test reuses one fake connection for registration and background
+    # ingestion; every connect call should still be matched by close.
+    assert fake_conn.close.await_count == connect_mock.await_count
 
 
 @pytest.mark.asyncio
@@ -217,6 +230,7 @@ async def test_entry_insert_clears_error_message(monkeypatch) -> None:
     tmp = _make_temp_file()
     try:
         await pipeline.ingest_document(tmp, doc_class="general")
+        await _await_background_tasks(pipeline_module)
     finally:
         os.unlink(tmp)
 
@@ -264,6 +278,7 @@ async def test_reuse_path_update_clears_error_message(monkeypatch) -> None:
     tmp = _make_temp_file()
     try:
         await pipeline.ingest_document(tmp, doc_class="general")
+        await _await_background_tasks(pipeline_module)
     finally:
         os.unlink(tmp)
 

@@ -110,6 +110,8 @@ _ALTER_STATEMENTS: List[tuple[str, str]] = [
     ("doc_registry.updated_at", "ALTER TABLE doc_registry ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ"),
     ("doc_registry.uploaded_by_user_id", "ALTER TABLE doc_registry ADD COLUMN IF NOT EXISTS uploaded_by_user_id TEXT"),
     ("doc_registry.created_at", "ALTER TABLE doc_registry ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"),
+    ("doc_registry.ingestion_stage", "ALTER TABLE doc_registry ADD COLUMN IF NOT EXISTS ingestion_stage TEXT"),
+    ("doc_registry.ingestion_heartbeat_at", "ALTER TABLE doc_registry ADD COLUMN IF NOT EXISTS ingestion_heartbeat_at TIMESTAMPTZ"),
     ("parent_chunks.section_path", "ALTER TABLE parent_chunks ADD COLUMN IF NOT EXISTS section_path TEXT"),
     ("parent_chunks.created_at", "ALTER TABLE parent_chunks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"),
     # ── sessions migration: pre-T1 init_db.py defined a stub `sessions`

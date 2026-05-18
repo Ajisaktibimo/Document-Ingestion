@@ -185,7 +185,7 @@ export function SessionsPage() {
                   </div>
                   <div className="flex items-center gap-2">
                     <div className="text-[10px] px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground font-medium uppercase tracking-wider">
-                      {s.message_count} messages
+                      {s.message_count ?? 0} messages
                     </div>
                     {s.doc_ids && s.doc_ids.length > 0 && (
                       <div className="text-[10px] px-2 py-0.5 rounded-full bg-primary/5 text-primary font-medium uppercase tracking-wider">

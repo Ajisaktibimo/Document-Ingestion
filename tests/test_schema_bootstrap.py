@@ -45,6 +45,8 @@ async def test_bootstrap_schema_runs_all_ddl(monkeypatch) -> None:
     assert "CREATE TABLE IF NOT EXISTS sessions" in sql_seen
     assert "CREATE TABLE IF NOT EXISTS session_messages" in sql_seen
     assert "uploaded_by_user_id" in sql_seen
+    assert "ADD COLUMN IF NOT EXISTS ingestion_stage" in sql_seen
+    assert "ADD COLUMN IF NOT EXISTS ingestion_heartbeat_at" in sql_seen
     assert "CREATE TABLE IF NOT EXISTS cross_references" in sql_seen
     assert "CREATE TABLE IF NOT EXISTS audit_log" in sql_seen
     assert "ADD COLUMN IF NOT EXISTS section_path" in sql_seen
